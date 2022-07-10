@@ -6,60 +6,83 @@
 выполняются несколько иттераций с автоулучшениеим.
 На каждой иттерации берется только часть данных, что бы влезало в память
 '''
+import math
 import sys
 from os import path
+import os
 from datetime import datetime
 from random import random, randint
 import re
 
+import itertools
+import matplotlib.pyplot as plt
 import numpy
 # import treelite as treelite
 import xgboost
 import pandas
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, roc_curve, auc, average_precision_score, confusion_matrix
 from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
 from xgboost import plot_importance
 import dask.dataframe as dd
-import logging
+# import logging
+import pyarrow
 
-import fastparquet
+# УКАЗЫВАЕМ функцию, которую будем использовать. Регрессор для непрерывных величин, классификатор для классификации (в первую очередь бинарная)
+xgboost_func = xgboost.XGBRegressor
+#xgboost_func = xgboost.XGBClassifier
+
+# import fastparquet
 # import snappy
 
-import exportXG
 
-subsample = 0.99
-max_depth = 11
-n_estimators = 10
-max_datasize = 210000
+experiment_name = "stat_all_pyram.txt"
+filename = r'stat_all_pyram.txt'
+final_model_filename = './1.bst.tmp'
 
-# create logger with 'xgb_dask'
-logger = logging.getLogger('xgb_dask')
-logger.setLevel(logging.DEBUG)
-# create file handler which logs even debug messages
-fh = logging.FileHandler('xgb_dask.log')
-fh.setLevel(logging.DEBUG)
-# create console handler with a higher log level
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
-# create formatter and add it to the handlers
-formatter = logging.Formatter('%(asctime)s - %(message)s - %(name)s - %(levelname)s')
-fh.setFormatter(formatter)
-ch.setFormatter(formatter)
-# add the handlers to the logger
-logger.addHandler(fh)
-logger.addHandler(ch)
+class_0_name="Identical"    
+class_1_name="Different"    
+
+max_datasize = 50000  # максимальное число строчек для обработки за один раз
+# чем меньше колонок, тем больше строчек можно обработать
+
+do_hyperopt = False
+
+colsample_bylevel=0.98
+colsample_bytree=0.65
+eta=0.044
+gamma=1.2
+max_depth = 8  # 11
+min_child_weight=1.0
+n_estimators = 80  # 10
+subsample = 0.75  # 0.99
+
+
+
+from loguru import logger
+import sys
+
+logger.remove()
+logger.add("xgb_dask.log", rotation="150 MB", backtrace=True, diagnose=True)  # Automatically rotate too big file
+logger.add(sys.stdout, colorize=True, format="<green>{time:HH:mm:ss}</green> <level>{message}</level>", level='INFO')
 
 from psutil import virtual_memory
 
 mem = virtual_memory()
 if mem.total < 16e09:
     max_datasize = round(max_datasize / (17e09 / mem.total))
-    logger.info('max_datasize={}'.format(max_datasize))
+    logger.warning('max_datasize={}'.format(max_datasize))
 
 import m2cgen
 
 def exportC(model, filename):
     code = m2cgen.export_to_c_sharp(model)
+    text_file = open(filename, "w")
+    n = text_file.write(code)
+    text_file.close()
+    return
+
+def exportPy(model, filename):
+    code = m2cgen.export_to_python(model)
     text_file = open(filename, "w")
     n = text_file.write(code)
     text_file.close()
@@ -121,34 +144,75 @@ def timer(start_time=None):
         return datetime.now()
 
 
-def test(model, df_test_X, df_test_Y, save=True):
+def test(model, df_test_X, df_test_Y, name, save=True):
     global bestF1
-    try:
-        model.get_booster().dump_model('./result/anom_x_{}.dmp'.format('tmp'))
-        # print("Accuracy:", end='', flush=True)
-        # make predictions for test data
-        y_pred = model.predict(df_test_X)
-        predictions = [round(value) for value in y_pred]
-        # evaluate predictions
-        accuracy = accuracy_score(df_test_Y, predictions)
-        from sklearn.metrics import f1_score
-        f1 = f1_score(df_test_Y, predictions)
-        logger.info("Accuracy: {:.2f}% F1: {:.2f}% ".format(accuracy * 100.0, f1 * 100))
-    except:
-        print('Error test, ignoring....')
-        logger.error('Error test:' + sys.exc_info()[0])
-        bestF1 = -1
+    if not df_test_X.isnull().sum().sum() == 0:
+        logger.error(f"not df_test_X.isnull().sum().sum() == 0, sum is {df_test_X.isnull().sum().sum()}")
+    if not df_test_Y.isnull().sum().sum() == 0:
+        logger.error(f"not df_test_Y.isnull().sum().sum() == 0, sum is {df_test_Y.isnull().sum().sum()}")
+
+    model.get_booster().dump_model('./result/anom_x_{}.dmp'.format('tmp'))
+    # print("Accuracy:", end='', flush=True)
+    # make predictions for test data
+    y_pred = model.predict(df_test_X)
+    #predictions = [round(value) for value in y_pred]
+    predictions = [1 if value >0.5 else 0 for value in y_pred]
+    print(f'nan count df_test_X: {df_test_X.isnull().sum().sum()}')
+    print(f'nan count df_test_Y: {df_test_Y.isnull().sum().sum()}')
+    print(f'nan count y_pred: {numpy.isnan(y_pred).sum()}')
+    print(f'Range of values y_pred: {numpy.ptp(y_pred)}')
+
+    from sklearn.metrics import f1_score
+    f1 = f1_score(df_test_Y, predictions)
+    accuracy = accuracy_score(df_test_Y, predictions)
+    map = average_precision_score(df_test_Y, predictions)
+
+    if f1> bestF1:
+        confusion_name = name
+    else:
+        confusion_name = f'{name} mAP={map}'
+    r = confusion_matrix(df_test_Y, predictions)
+
+    plot_confusion_matrix(r, classes=[class_0_name,class_1_name], normalize = True, title=f'{confusion_name} Confusion matrix')
+    
+
+    fpr, tpr, _ = roc_curve(df_test_Y.values, y_pred)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure()
+    lw = 2
+    plt.plot(
+            fpr,
+            tpr,
+            color="darkorange",
+            lw=lw,
+            label="ROC curve (area = %0.5f)" % roc_auc,
+        )
+    logger.info("{} AUC: {}".format(name, roc_auc))
+    plt.plot([0, 1], [0, 1], color="navy", lw=lw, linestyle="--")
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"{name}: Receiver operating characteristic")
+    plt.legend(loc="lower right")
+        # plt.show()
+    plt.savefig("./result/" + str(name) + " ROC - {}.png".format(map))
+    plt.close()
+    logger.info("{} Accuracy: {}% F1: {}% mAP: {}% mean average error: {}%".format(name, accuracy * 100.0,
+                                                                                           f1 * 100, map * 100,
+                                                                                            100 - map * 100))
     if (save and f1 > bestF1):
-        model.save_model('./result/anom_x_{}.bst'.format(f1))
-        model.get_booster().dump_model('./result/anom_x_{}.dmp'.format(f1))
+        model.save_model('./result/model_x_{}.bst'.format(f1))
+        model.get_booster().dump_model('./result/model_x_{}.dmp'.format(f1))
         # exportC(model, './result/anom_x_{}.CS'.format(F1) )
         bestF1 = f1
-        '''
-            try:
-                ExportC(model, 'xgb_class_{}.CS'.format(F1))
-            except:
-                print('Error export' )
-            '''
+        # exportC(model, 'xgb_class_{}.CS'.format(f1))
+        try:
+            exportC(model, './result/xgb_class_{}.CS'.format(f1))
+            exportPy(model, './result/xgb_class_{}.py'.format(f1))
+        except Exception as e:
+            logger.error(f'Error export model: {e}')
     return f1
 
 
@@ -168,13 +232,14 @@ def reoptimize_to_Parquiet(bigDF, outfilename):
         logger.info('Dataframe is None, read ' + outfilename)
     else:
         logger.debug('Start write ' + outfilename)
-        bigDF.to_parquet(outfilename, engine='fastparquet')
+        bigDF.to_parquet(outfilename, engine='pyarrow', compression="snappy")
         logger.info('Fin    write ' + outfilename)
-    return dd.read_parquet(outfilename, engine='fastparquet')
+    return dd.read_parquet(outfilename, engine='pyarrow')
 
 
 def resampleTrainData(df_train):
     logger.debug('resampleData()')
+    logger.info("resampleTrainData start...........")
     # из большой кучи df_train делаем случайную подвыборку
     # sample_ratio должен быть небольшой, что бы результат влез в память XGB
     # global df_train_Y
@@ -183,6 +248,7 @@ def resampleTrainData(df_train):
     df_train_X = df_train.sample(frac=sample_ratio).compute()
     df_train_Y = df_train_X['result']
     df_train_X.drop(columns=['result'], inplace=True)
+    logger.info("resampleTrainData end")
     return df_train_X, df_train_Y
 
 
@@ -191,12 +257,14 @@ def preprocessRAWdata(filename):
     global df_train, df_test
     logger.info('Load data ' + filename)
     if filename.find('.par') > 0:
-        dataf = dd.read_parquet(filename, engine='fastparquet')
+        dataf = dd.read_parquet(filename, engine='pyarrow')
     else:
         dataf = dd.read_csv(filename, skiprows=[1], skipinitialspace=True)
 
     dataf = dataf.rename(columns=lambda x: colRenamer(x))  # меняем заголовок
-
+    if len(dataf.describe())<80*25:
+        print(dataf.describe()) # выводим на экран краткое описание таблицы    
+    
     # теперь составим список записей для удаления
     cols_name = []
     for col in dataf.columns:
@@ -223,65 +291,96 @@ def preprocessRAWdata(filename):
     # dataf = dataf.drop(labels=lambda x: x.find('1'), axis=1)
     # print(dataf.head())
 
-    logger.debug('Split data')
     # train_size = round( 0.9 * dataf.shape[0].compute())
 
-    train_percent = 5 / 100  # для теста берем маленькую часть
+    train_percent = 15 / 100  # для теста берем маленькую часть
+    logger.debug(f'Split data. train_percent={train_percent}')
     df_train, df_test = dataf.random_split([1 - train_percent, train_percent])
     return df_train, df_test
+
+
+def plot_confusion_matrix(cm, classes, normalize=False, title='Confusion matrix', cmap=plt.cm.Blues):
+    """
+    This function prints and plots the confusion matrix.
+    Normalization can be applied by setting normalize=True.
+    refence:
+        http://scikit-learn.org/stable/auto_examples/model_selection/plot_confusion_matrix.html
+    """
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, numpy.newaxis]
+        print("Normalized confusion matrix")
+    else:
+        print('Confusion matrix, without normalization')
+
+    print(cm)
+
+    plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = numpy.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45)
+    plt.yticks(tick_marks, classes)
+
+    fmt = '.4f' if normalize else 'd'
+    thresh = cm.max() / 2.
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        plt.text(j, i, format(cm[i, j], fmt),
+                 horizontalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black")
+
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.savefig(f'./result/{title}.png')
+    plt.close()
 
 
 if __name__ == '__main__':
     # execute this only when run directly, not when imported!
     # Это условие нужно, что бы в Windows работал num_workers=x
 
-    # print('start')
-    logger.info('Start')
+    logger.info('Start ' + experiment_name)
     start_timer = timer()
-    # print('Old sys.getrecursionlimit={}'.format(sys.getrecursionlimit()))
+    logger.debug('Old sys.getrecursionlimit={}'.format(sys.getrecursionlimit()))
     sys.setrecursionlimit(5000)
-    # print('New sys.getrecursionlimit={}'.format(sys.getrecursionlimit()))
     logger.debug('New sys.getrecursionlimit={}'.format(sys.getrecursionlimit()))
+    os.makedirs('data', exist_ok = True)
+    os.makedirs('result', exist_ok = True)
+    
     bestF1 = 0
 
     df_test = None
     df_train = None
 
-    filename = 'small1_55.csv'
-    filename = 'small.csv'
-    filename = 'd:/tmp/StatSimil/JpgSimilarStat.csv'
-    filename = 'test.csv'
-    filename = 'small1_55.parquet'
-    filename = 'JpgSimilarStat.parquet'
-
     if not path.exists('./data/test.parquet'):  # ! если есть "наш" паркет, то перескакиваем
-        df_train, df_test = preprocessRAWdata(
-            filename)  # !включаем это, ТОЛЬКО если хотим заново загрузить сырые данные!
+        # !включаем это, ТОЛЬКО если хотим заново загрузить сырые данные!
+        df_train, df_test = preprocessRAWdata(filename)  
+    else:
+        logger.warning('Use data src from ./data/test.parquet' )
 
-    df_train = reoptimize_to_Parquiet(df_train, 'data/train.parquet')  # реоптимизация и сохранение или загрузка  data
-    df_test = reoptimize_to_Parquiet(df_test, 'data/test.parquet')  # реоптимизация и сохранение или загрузка  data
+    df_train = reoptimize_to_Parquiet(df_train, './data/train.parquet')  # реоптимизация и сохранение или загрузка  data
+    df_test = reoptimize_to_Parquiet(df_test, './data/test.parquet')  # реоптимизация и сохранение или загрузка  data
 
     logger.debug('Test data process')
     df_test_Y = df_test['result']
     df_test = df_test.drop('result', axis=1)
 
-    df_train['AT_0_T'] = 0  # вроде это неудачная фича (только не удалять, иначе сместятся индексы колонок)
     logger.debug('Get length df_train')
     total_data = df_train.shape[0].compute()  # len(df_train)
     sample_ratio = max_datasize / total_data
     if sample_ratio > 1:
         sample_ratio = 1
 
-    '''
-    logger.info('Start HyperParams optimize')
-    sample_ratio = sample_ratio*0.95
-    df_train_X, df_train_Y = resampleTrainData(df_train)  # сделали подвыборку
-    # model = xgboost.XGBClassifier(max_depth=9, n_estimators=150, subsample=1)
-    # getHyperParams(model, df_train_X, df_train_Y)
-    import xgb_hyperopt
-    xgb_hyperopt.do_process(df_train_X, df_train_Y, df_test.compute(), df_test_Y.compute())
-    input("Press Enter to continue...")
-    '''
+    if do_hyperopt:
+        logger.info('Start HyperParams optimize')
+        sample_ratio = sample_ratio*0.95
+        df_train_X, df_train_Y = resampleTrainData(df_train)  # сделали подвыборку
+        # model = xgboost.XGBClassifier(max_depth=9, n_estimators=150, subsample=1)
+        # getHyperParams(model, df_train_X, df_train_Y)
+        import xgb_hyperopt
+        xgb_hyperopt.xgboost_func=xgboost_func
+        xgb_hyperopt.do_process(df_train_X, df_train_Y, df_test.compute(), df_test_Y.compute())
+        input("Press Enter to continue...")
 
     logger.info(
         'Total train data {}; test data {}.  Ratio of train part {:.3f}'.format(total_data, len(df_test), sample_ratio))
@@ -290,32 +389,49 @@ if __name__ == '__main__':
     logger.info('xgboost train')
     model = None
 
-    if path.exists('./1.bst.tmp'):
-        logger.info('Try load ./1.bst.tmp')
-        model = xgboost.XGBClassifier(max_depth=max_depth, n_estimators=n_estimators, subsample=subsample)
-        model.load_model('./1.bst.tmp')
-        f1score = test(model, df_test, df_test_Y, save=False)
-        # model.save_model('1.bst.tmp')
+    if path.exists(final_model_filename):
+        logger.warning(f'Try load and retraining {final_model_filename}')
+        model = xgboost_func(max_depth=max_depth, n_estimators=n_estimators, subsample=subsample)
+        model.load_model(final_model_filename)
+        f1score = test(model, df_test.compute(), df_test_Y.compute(), name=experiment_name, save=False)
 
-    for i in range(100):
+    max_iter = round(1/sample_ratio) + 8 
+    if sample_ratio > 0.95:
+        max_iter = 8
+    for i in range(max_iter):
         start_timer = timer()
         df_train_X, df_train_Y = resampleTrainData(df_train)  # сделали подвыборку
         if model is None:
             logger.debug('First model.fit()')
-            model = xgboost.XGBClassifier(max_depth=max_depth, n_estimators=n_estimators, subsample=subsample,
-                                          colsample_bylevel=0.98,
-                                          colsample_bytree=0.98,
-                                          learning_rate=0.4,
-                                          min_child_weight=9.0,
-                                          gamma=3)
-            # model = xgboost.XGBRegressor(max_depth=max_depth, n_estimators=n_estimators, subsample=subsample)
+            '''
+            Params: {
+            'colsample_bylevel': 0.8432347511150223, 
+            'colsample_bytree': 0.8864742601005552,
+            'eta': 0.03309426695712256, 
+            'gamma': 1.4332841515555286, 
+            'max_depth': 8.0, 
+            'min_child_weight': 10.0, 
+            'n_estimators': 558.0, 
+            'subsample': 0.7142347574800574}
+            '''
+
+                                          
+            model = xgboost_func(max_depth=max_depth, n_estimators=n_estimators, subsample=subsample,
+                                          colsample_bylevel=colsample_bylevel,
+                                          colsample_bytree=colsample_bytree,
+                                          learning_rate=eta,
+                                          min_child_weight=min_child_weight,
+                                          gamma=gamma)            
+
             model.fit(df_train_X, df_train_Y, verbose=True)
-            model.save_model('1.bst.tmp')
+            model.save_model(final_model_filename)
+
         else:
-            logger.debug('model.fit()')
-            model.fit(df_train_X, df_train_Y, verbose=True, xgb_model='1.bst.tmp')
-            model.save_model('1.bst.tmp')
-        f1score = test(model, df_test.compute(), df_test_Y.compute(), save=True)
+            logger.debug('existing retraining model.fit()')
+            model.fit(df_train_X, df_train_Y, verbose=True, xgb_model=final_model_filename)
+            model.save_model(final_model_filename)
+
+        f1score = test(model, df_test.compute(), df_test_Y.compute(), name=experiment_name, save=True)
         start_timer = timer(start_timer)
 
     # input("Press Enter to continue...")
